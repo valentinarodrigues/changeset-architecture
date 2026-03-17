@@ -1,0 +1,3 @@
+{"entityId":"ENT-101","firstName":1,"lastName":1,"email":1,"phone":1,"status":1,"tier":1,"address":1,"country":1,"createdAt":1}
+{"entityId":"ENT-102","firstName":1,"lastName":1,"email":1,"phone":1,"status":1,"tier":1,"address":1,"country":1,"createdAt":1}
+{"entityId":"ENT-103","firstName":1,"lastName":1,"email":1,"phone":1,"status":1,"tier":1,"address":1,"country":1,"createdAt":1}

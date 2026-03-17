@@ -1,0 +1,3 @@
+{"entityId":"ENT-101","firstName":"Alice","lastName":"Brown","email":"alice@newco.com","phone":"+15550010101","status":"ACTIVE","tier":"BRONZE","address":"10 New Lane","country":"US","createdAt":"2024-03-15T08:00:00Z"}
+{"entityId":"ENT-102","firstName":"Bob","lastName":"Martinez","email":"bob@techstart.io","phone":"+15550010202","status":"ACTIVE","tier":"SILVER","address":"20 Startup Blvd","country":"US","createdAt":"2024-03-15T08:01:00Z"}
+{"entityId":"ENT-103","firstName":"Carol","lastName":"White","email":"carol@venture.com","phone":"+15550010303","status":"ACTIVE","tier":"GOLD","address":"30 VC Drive","country":"CA","createdAt":"2024-03-15T08:02:00Z"}

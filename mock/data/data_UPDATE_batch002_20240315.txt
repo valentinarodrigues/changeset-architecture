@@ -1,0 +1,3 @@
+{"entityId":"ENT-001","email":"john.smith@acme.com","tier":"PLATINUM"}
+{"entityId":"ENT-002","phone":"+15550099999","status":"INACTIVE"}
+{"entityId":"ENT-003","address":"100 New Street","country":"US"}
