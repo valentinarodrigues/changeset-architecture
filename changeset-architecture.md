@@ -398,18 +398,24 @@ audit_{INSERT|UPDATE|DELETE}_{batchId}_{YYYYMMDD}.txt
 
 ## SNS Event Contract
 
-### SNS Message Attributes (for filter policies)
+### Message Attributes (for SNS filter policies — set outside the body)
 
-| Attribute     | Type   | Values                       | Description                          |
-|--------------|--------|------------------------------|--------------------------------------|
-| changeType   | String | `INSERT`, `UPDATE`, `DELETE` | Type of change                       |
-| entityType   | String | e.g. `Customer`, `Order`     | Domain entity type                   |
-| batchId      | String | UUID                         | Groups all events from one file drop |
-| eventVersion | String | `1.0`                        | Schema version for evolution         |
+| Attribute | Type | Set on | Values | Purpose |
+|-----------|------|--------|--------|---------|
+| `eventType` | String | All events | `ENTITY_CHANGESET`, `BATCH_MANIFEST` | Primary routing |
+| `changeType` | String | **ENTITY_CHANGESET only** | `INSERT`, `UPDATE`, `DELETE` | Change-type filtering |
+| `entityType` | String | All events | e.g. `Customer`, `Order` | Entity-type filtering |
+| `batchId` | String | All events | e.g. `batch-20240315-abc123` | Batch correlation |
+| `eventVersion` | String | All events | `1.0` | Schema evolution |
+| `publisher` | String | All events | `changeset-pipeline` | Source system tag |
+
+> ⚠️ **`changeType` is intentionally omitted from `BATCH_MANIFEST` events.**
+> If it were set, consumers filtering only on `eventType=BATCH_MANIFEST` would also need to handle `changeType`,
+> creating confusion. Omitting it keeps analytics/bulk consumers' filter policies simple.
 
 ---
 
-### SNS Payload Schema — Recommended: Metadata + S3 Pointer
+### ENTITY_CHANGESET Body Schema
 
 > SNS has a 256KB message limit. With 100K+ entities in a 300MB file, embedding payloads
 > is not viable. S3 pointer keeps each message ~1KB, minimises SNS cost, and lets consumers
@@ -417,30 +423,79 @@ audit_{INSERT|UPDATE|DELETE}_{batchId}_{YYYYMMDD}.txt
 
 ```json
 {
-  "eventId": "uuid-v4",
+  "eventId": "a3f1c2e4-7b8d-4f2a-9c1e-3d5f6a7b8c9d",
   "eventVersion": "1.0",
   "eventType": "ENTITY_CHANGESET",
   "changeType": "UPDATE",
   "entityType": "Customer",
   "entityId": "ENT-001",
   "batchId": "batch-20240315-abc123",
+  "batchDate": "2024-03-15",
   "occurredAt": "2024-03-15T10:32:00Z",
-  "processedAt": "2024-03-15T10:45:22Z",
+  "publishedAt": "2024-03-15T10:45:22Z",
 
   "changeset": {
-    "changedFields": ["firstName", "email"],
-    "deltaRef": "s3://bucket/changesets/Customer/2024-03-15/batch-abc123/updates/ENT-001_delta.json",
-    "fullAuditRef": "s3://bucket/changesets/Customer/2024-03-15/batch-abc123/updates/ENT-001_audit.json"
+    "changedFields": ["email", "tier"],
+    "deltaRef": {
+      "bucket": "changeset-bucket",
+      "key": "changesets/Customer/2024-03-15/batch-abc123/updates/ENT-001_delta.json",
+      "sizeBytes": 512
+    },
+    "auditRef": {
+      "bucket": "changeset-bucket",
+      "key": "changesets/Customer/2024-03-15/batch-abc123/updates/ENT-001_audit.json",
+      "sizeBytes": 256
+    }
   },
 
-  "source": {
-    "dataFile": "s3://bucket/landing/2024-03-15/batch-abc123/data_UPDATE_batch-abc123_20240315.txt",
-    "auditFile": "s3://bucket/landing/2024-03-15/batch-abc123/audit_UPDATE_batch-abc123_20240315.txt"
+  "batch": {
+    "totalEntitiesInBatch": 100000,
+    "batchPosition": 1
   },
 
   "processing": {
     "emrJobId": "j-XXXXXXXXXX",
-    "stepFunctionExecutionId": "arn:aws:states:..."
+    "stepFunctionExecutionId": "arn:aws:states:us-east-1:123456789012:execution:changeset-pipeline:batch-abc123"
+  }
+}
+```
+
+---
+
+### BATCH_MANIFEST Body Schema
+
+```json
+{
+  "eventId": "b7d2e5f8-1a3c-4e6d-8f0b-2c4d6e8f0a2b",
+  "eventVersion": "1.0",
+  "eventType": "BATCH_MANIFEST",
+  "entityType": "Customer",
+  "batchId": "batch-20240315-abc123",
+  "batchDate": "2024-03-15",
+  "publishedAt": "2024-03-15T10:45:22Z",
+
+  "summary": {
+    "totalEntities": 100000,
+    "inserts": 3000,
+    "updates": 95000,
+    "deletes": 2000
+  },
+
+  "manifestRef": {
+    "bucket": "changeset-bucket",
+    "key": "changesets/Customer/2024-03-15/batch-abc123/manifest.json",
+    "sizeBytes": 2048
+  },
+
+  "paths": {
+    "inserts": "s3://changeset-bucket/changesets/Customer/2024-03-15/batch-abc123/inserts/",
+    "updates": "s3://changeset-bucket/changesets/Customer/2024-03-15/batch-abc123/updates/",
+    "deletes": "s3://changeset-bucket/changesets/Customer/2024-03-15/batch-abc123/deletes/"
+  },
+
+  "processing": {
+    "emrJobId": "j-XXXXXXXXXX",
+    "stepFunctionExecutionId": "arn:aws:states:us-east-1:123456789012:execution:changeset-pipeline:batch-abc123"
   }
 }
 ```
@@ -458,6 +513,26 @@ audit_{INSERT|UPDATE|DELETE}_{batchId}_{YYYYMMDD}.txt
 **Recommended hybrid: A + C**
 - Option A per-entity events → real-time consumers (microservices, search, audit)
 - Option C batch manifest → analytics/warehouse consumers that process the full file
+
+---
+
+### Presigned URLs vs IAM Bucket Policy for S3 Access
+
+Consumers need to fetch `deltaRef` / `auditRef` from S3. Two access patterns:
+
+| Factor | IAM Bucket Policy ✅ Recommended | Presigned URLs |
+|--------|----------------------------------|----------------|
+| **Consumer setup** | IAM role + cross-account trust | Zero setup |
+| **Expiry** | Never (role-based) | Fixed TTL — set at publish time |
+| **Backlog handling** | Consumer reads whenever ready | URLs expire; unusable if queue backlogs |
+| **Replay (30-day archive)** | Works perfectly | URLs long-expired |
+| **Audit trail** | CloudTrail: who read what, when | Holder reads anonymously |
+| **Revocation** | Remove policy immediately | Must wait for TTL |
+| **Non-AWS consumers** | Not possible | ✅ Perfect fit |
+
+> **Decision**: Use IAM bucket policy for all registered internal consumers (already implemented).
+> Presigned URLs are reserved for external/non-AWS consumers — add `"accessMethod": "presigned_url"`
+> to `consumers.json` as an opt-in for those cases.
 
 ---
 
@@ -544,26 +619,101 @@ s3://your-bucket/
 
 ## Consumer Onboarding Guide
 
+### Why SNS Publishing is NOT Part of the EMR Job
+
+Publishing to SNS is deliberately a **separate Step Functions state (Lambda)** that runs after EMR terminates — not embedded in the Spark job. Key reasons:
+
+| Reason | Detail |
+|--------|--------|
+| **Commit-then-notify** | SNS fires only after `TerminateEMR` succeeds — data is fully committed to S3. If EMR fails and retries, no phantom events are sent. |
+| **Spark retry = duplicate events** | Spark retries failed tasks on other executors. Publishing from executors would create duplicate SNS events before the job even finishes. |
+| **Blast radius isolation** | If SNS is throttled or misconfigured, only the publish step fails — not the 20-minute Spark job. Retry just the Lambda, not EMR. |
+| **IAM least privilege** | EMR workers need `s3:PutObject/GetObject` only. SNS publish belongs on the Lambda's dedicated role, not the EMR execution role. |
+| **Cost** | SNS API calls in EMR driver are billed at EMR vCPU rates ($0.052/hr). The same work in Lambda costs ~100× less. |
+| **Clean observability** | Discrete CloudWatch metrics for the publish phase — latency, success rate, DLQ depth — fully separate from EMR job metrics. |
+| **Manifest hand-off** | EMR writes `manifest.json` as its "done" signal. The Lambda reads it and publishes. This decoupling means you can swap EMR for any processor without changing the notification layer. |
+
+---
+
+### Consumer Onboarding Checklist
+
+```
+CONSUMER ONBOARDING CHECKLIST
+══════════════════════════════════════════════════════════════
+
+  INFRASTRUCTURE
+  [ ] Create SQS queue  (e.g. my-service-changeset-queue)
+  [ ] Create DLQ        (e.g. my-service-changeset-dlq)
+  [ ] Attach DLQ to main queue — maxReceiveCount = 3
+  [ ] Set visibility timeout ≥ 6× your Lambda timeout
+  [ ] Enable SQS long polling: ReceiveMessageWaitTimeSeconds = 20
+  [ ] Apply SQS resource policy (allow sns.amazonaws.com from publisher SNS ARN)
+
+  S3 ACCESS  (only if fetching deltaRef / auditRef)
+  [ ] Confirm your account ID is in publisher's S3 bucket policy
+  [ ] Test: aws s3 cp s3://changeset-bucket/changesets/... (should succeed)
+  [ ] Scope IAM role to read changesets/ prefix only — not entire bucket
+
+  SUBSCRIPTION
+  [ ] Add entry to consumers.json (name, accountId, queueName, filterPolicy)
+  [ ] Confirm SNS subscription status = "Confirmed" (not PendingConfirmation)
+  [ ] Smoke-test: request a test event from publisher in non-prod
+
+  APPLICATION CODE
+  [ ] Parse SQS message → unwrap SNS envelope → parse event JSON body
+  [ ] Implement idempotency: store + check eventId (DynamoDB / Redis)
+  [ ] Handle at-least-once delivery: same eventId may arrive more than once
+  [ ] Handle eventVersion: tolerate unknown fields (forward compatible)
+  [ ] For ENTITY_CHANGESET: use changedFields to know what actually changed
+  [ ] For BATCH_MANIFEST: use paths.inserts/updates/deletes for bulk S3 reads
+  [ ] Delete SQS message ONLY after successful downstream write
+  [ ] On failure: let message return to queue → DLQ after maxReceiveCount
+
+  MONITORING
+  [ ] CloudWatch alarm: DLQ ApproximateNumberOfMessages > 0
+  [ ] CloudWatch alarm: SQS ApproximateAgeOfOldestMessage > threshold
+  [ ] CloudWatch alarm: Lambda error rate > 1%
+  [ ] Dashboard: throughput, consumer lag, DLQ depth
+  [ ] PagerDuty / OpsGenie alert wired to DLQ alarm
+
+  LOAD & FAILURE TESTING
+  [ ] Verify filter policy delivers expected event types only
+  [ ] Test volume: ~100K messages/batch is expected
+  [ ] Test idempotency: replay same event twice → no duplicate side effects
+  [ ] Test DLQ path: intentionally fail processing → confirm message parks in DLQ
+  [ ] Test backlog recovery: pause consumer 30 min → resume → all messages processed
+```
+
+---
+
 ### How to Subscribe
 1. Create an SQS queue in your account with a DLQ attached
-2. Request subscription to SNS topic `arn:aws:sns:region:account:entity-changesets`
-3. Set a filter policy (optional) — example:
-
+2. Add your entry to `consumers.json` — the publisher will register your subscription:
 ```json
 {
-  "changeType": ["UPDATE", "INSERT"],
-  "entityType": ["Customer"]
+  "name": "your-team",
+  "accountId": "YOUR_AWS_ACCOUNT_ID",
+  "region": "us-east-1",
+  "queueName": "your-queue-name",
+  "team": "Your Team Name",
+  "contact": "your-team@company.com",
+  "filterPolicy": {
+    "eventType": ["ENTITY_CHANGESET"],
+    "changeType": ["INSERT", "UPDATE"]
+  },
+  "s3ReadAccess": true,
+  "processingType": "microservice"
 }
 ```
 
 ### How to Process an Event
 1. Receive SQS message → parse SNS envelope → extract event body
-2. Check `changeType` for routing logic
+2. Check `eventType` → route to ENTITY_CHANGESET or BATCH_MANIFEST handler
 3. Idempotency check: store + check `eventId` to handle redeliveries
 4. Fetch from S3 if needed:
-   - Changed fields only → `changeset.deltaRef`
-   - Audit flags (which fields changed) → `changeset.fullAuditRef`
-5. Process and delete from SQS
+   - Changed values → `changeset.deltaRef`
+   - Which fields changed (1/0 flags) → `changeset.auditRef`
+5. Process and delete from SQS only on success
 
 ### Delivery Guarantees
 | Guarantee | Detail |
@@ -572,6 +722,29 @@ s3://your-bucket/
 | Ordering | Not guaranteed across entities; use `batchId` + `entityId` for within-batch ordering |
 | Replay | Raw files in `archive/` for 7 days; changesets in `changesets/` for 30 days |
 | Schema evolution | `eventVersion` bumped on breaking changes; consumers should tolerate unknown fields |
+
+---
+
+## S3 Bucket Strategy: Dedicated vs. Reuse Existing DL Bucket
+
+> **Recommendation: Use a dedicated S3 bucket for changesets.**
+
+| Factor | Reuse DL Bucket | Dedicated Changeset Bucket ✅ |
+|--------|-----------------|-------------------------------|
+| **Lifecycle rules** | Mixed retention (DL=90d, changesets=30d) → complex prefix-scoped rules | Single, clean lifecycle rule |
+| **Access control** | Consumer account grants mix with DL pipeline roles → growing blast radius | Scoped to changeset consumers only |
+| **Ownership** | Shared — policy changes need DL team coordination | Owned entirely by changeset pipeline |
+| **Cost attribution** | Storage + GET costs mixed with DL workload | Clean via bucket tags (`Team: changeset-pipeline`) |
+| **Path collisions** | Risk if DL already uses `changesets/` prefix | Fresh namespace, no conflicts |
+| **Security** | Consumer misconfiguration could expose DL raw data | Consumers only ever see changeset data |
+
+### If You Must Reuse the DL Bucket
+Apply these constraints:
+1. **Dedicated prefix**: `s3://existing-dl-bucket/entity-changesets/` (check for conflicts first)
+2. **Prefix-scoped consumer grants**: `"Resource": "arn:aws:s3:::dl-bucket/entity-changesets/*"`
+3. **Separate S3 Lifecycle rule** scoped to `entity-changesets/` prefix only
+4. **Object tagging**: tag all writes with `Component: changeset-pipeline` for cost allocation
+5. **Document the policy change** with the DL team — any bucket policy update affects them too
 
 ---
 
