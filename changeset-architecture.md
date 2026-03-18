@@ -748,6 +748,185 @@ Apply these constraints:
 
 ---
 
+## Scale: 6 Files × 300K Rows — Event Granularity
+
+> **6 files/day = 3 change types × (data file + audit file). At 300K rows per file,
+> there are 900K unique entities across the batch.**
+
+---
+
+### Model A — Single Event Per Change Type  (3 events/day)
+
+One SNS event per change type pointing to the S3 file. Consumers download and process the entire file themselves.
+
+```
+EMR ──► S3 partitioned files ──► 3 SNS CHANGE_FILE_READY events (one per changeType)
+                                  │
+                                  └─► consumers fetch file from S3 and iterate rows themselves
+```
+
+**SNS event body:**
+```json
+{
+  "eventType": "CHANGE_FILE_READY",
+  "changeType": "INSERT",
+  "entityType": "Customer",
+  "batchId": "batch-20240315-abc123",
+  "batchDate": "2024-03-15",
+  "recordCount": 300000,
+  "s3Files": {
+    "delta": "s3://bucket/changesets/Customer/2024-03-15/batch-abc123/inserts/data.jsonl",
+    "audit": "s3://bucket/changesets/Customer/2024-03-15/batch-abc123/inserts/audit.jsonl"
+  }
+}
+```
+
+**Best for**: analytics, data warehouse (Redshift COPY), data lake — consumers that bulk-load entire files.
+**Not suitable for**: real-time per-entity reactions (microservices, search, audit).
+
+---
+
+### Model B — Per-Row Events  (900K events/day)
+
+One SNS `ENTITY_CHANGESET` event per entity. Delta values are included **inline** in the message body to avoid the S3 GET cost per entity per consumer.
+
+```
+EMR ──► writes 90 partition files (~10K entities each) to S3
+         └─► PublishChangesets Lambda reads partitions ──► 900K SNS events (multi-threaded)
+                                                            │
+                                                            └─► each consumer reacts to one entity
+```
+
+**Critical design choice — inline payload over S3 pointer:**
+
+| S3 Pointer (current per 100K design) | Inline Payload (required at 900K) |
+|--------------------------------------|-----------------------------------|
+| Each consumer fetches deltaRef from S3 | Delta values in SNS body — no S3 fetch |
+| 900K × 4 consumers = 3.6M S3 GETs/day | 0 S3 GETs for consumers |
+| $1.08/day in S3 GET costs | $0 S3 GET costs |
+| Works well at 100K entities | Required at 900K to keep cost manageable |
+
+**SNS event body (per-row with inline payload):**
+```json
+{
+  "eventType": "ENTITY_CHANGESET",
+  "changeType": "UPDATE",
+  "entityType": "Customer",
+  "entityId": "ENT-001",
+  "batchId": "batch-20240315-abc123",
+  "batchDate": "2024-03-15",
+  "publishedAt": "2024-03-15T10:45:22Z",
+
+  "changeset": {
+    "changedFields": ["email", "tier"],
+    "deltaPayload": { "email": "new@email.com", "tier": "GOLD" },
+    "deltaRef": {
+      "bucket": "changeset-bucket",
+      "key": "changesets/Customer/2024-03-15/batch-abc123/updates/part-0001.jsonl",
+      "entityId": "ENT-001"
+    }
+  }
+}
+```
+
+> `deltaPayload` is used by consumers for real-time processing.
+> `deltaRef` points to the partition file + entityId — used only for replay/audit from S3 archive.
+
+**Best for**: microservices, search indexing, audit — consumers that react to one entity at a time.
+**Use S3 fallback (no inline)** only if a single entity's delta exceeds ~200KB (rare).
+
+---
+
+### EMR Output Change for Model B
+
+Spark naturally writes partition files, not individual entity files. Align the output:
+
+```
+❌ Current (designed for 100K):   900K individual S3 files    ← 900K PUTs = $4.50/day
+✅ Correct for 900K:             ~90 partition files          ← $0.00 S3 PUT cost
+
+changesets/Customer/2024-03-15/batch-abc123/
+├── updates/
+│   ├── part-0001.jsonl   (10,000 entities with deltaPayload embedded)
+│   ├── part-0002.jsonl
+│   └── ...  (90 files total)
+└── manifest.json
+```
+
+Each partition file row is the **ready-to-publish SNS payload** built by Spark, including inline `deltaPayload`.
+
+---
+
+### Publishing 900K Events — Threaded Lambda
+
+The current sequential Lambda would exceed its 15-minute timeout at 900K:
+
+```
+900K ÷ 10 per PublishBatch = 90,000 API calls
+90,000 × ~20ms sequential  = ~30 minutes  ✗ exceeds Lambda limit
+```
+
+**Solution: multi-threaded PublishChangesets Lambda**
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def publish_partition(sns_client, topic_arn, entities_chunk):
+    batches = [entities_chunk[i:i+10] for i in range(0, len(entities_chunk), 10)]
+    for batch in batches:
+        sns_client.publish_batch(TopicArn=topic_arn,
+                                 PublishBatchRequestEntries=batch)
+
+def handler(event, context):
+    entities = read_partition_jsonl(event["partitionS3Key"])   # 10K entities/partition
+    chunks = split(entities, chunk_size=1000)                  # 100 chunks of 1K
+
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        futures = [executor.submit(publish_partition, sns, TOPIC_ARN, c) for c in chunks]
+        for f in as_completed(futures):
+            check_failures(f.result())
+
+# 90K calls ÷ 100 threads × 20ms = ~18 seconds total  ✓
+```
+
+**For even greater scale**: use **Step Functions Distributed Map** — each Lambda invocation handles one partition file (9K entities → 900 API calls → ~18 seconds), up to 1000 parallel invocations. One partition fails → only that partition retries.
+
+---
+
+### Cost Comparison at 900K Entities/day, 5 Consumers
+
+> EMR cost is the same for both models — data processing is identical.
+
+| Cost Driver | Model A — 3 batch events | Model B — inline payload | Model B — S3 pointer |
+|-------------|--------------------------|--------------------------|----------------------|
+| SNS Publish | ~$0.00 | $0.45/day | $0.45/day |
+| SNS Delivery (4 RT consumers × 900K) | ~$0.00 | $1.65/day | $1.65/day |
+| SQS (4 RT consumers × 900K × 3 ops) | ~$0.00 | $3.96/day | $3.96/day |
+| S3 PUTs (entity files) | ~$0.00 (3 files) | ~$0.00 (90 partition files) | **$4.50/day** (900K files) |
+| S3 GETs (consumer fetches) | ~$0.00 | **$0.00** (inline) | $1.08/day |
+| Lambda — consumer processing | file-scan based | $0.77/day | $0.77/day |
+| EMR (same both models) | ~$0.60/day | ~$0.60/day | ~$0.60/day |
+| **Total/day** | **~$0.62** | **~$7.43** | **~$13.01** |
+| **Total/month** | **~$19** | **~$223** | **~$390** |
+
+---
+
+### Which Model for Which Consumer
+
+| Consumer | Recommended Model | Reason |
+|----------|------------------|--------|
+| **microservice-team** | Model B — per-row, inline | Real-time reaction to individual entity changes |
+| **search-team** | Model B — per-row, inline (INSERT+UPDATE only) | Re-index one entity at a time |
+| **audit-team** | Model B — per-row, inline | Audit trail is entity-scoped |
+| **analytics-team** | Model A — BATCH_MANIFEST | Bulk Redshift COPY from full file; per-entity events wasteful |
+| **data-lake-team** | Model A — BATCH_MANIFEST | Partitioned S3 write is the natural ingestion unit |
+
+> **The hybrid is already designed in** — ENTITY_CHANGESET serves the 3 real-time consumers,
+> BATCH_MANIFEST serves the 2 bulk consumers. At 900K scale, add inline `deltaPayload` to
+> ENTITY_CHANGESET and switch to partition files in EMR output.
+
+---
+
 ## Infrastructure Summary
 
 | Component | Service | Role |
