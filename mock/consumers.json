@@ -1,0 +1,81 @@
+{
+  "_comment": "Consumer registry. Add a new entry here and rerun simulation.py to onboard a new consumer.",
+  "publisherAccountId": "123456789012",
+  "snsTopicName": "entity-changesets",
+  "region": "us-east-1",
+  "s3Bucket": "mock-changeset-bucket",
+
+  "consumers": [
+    {
+      "name": "microservice-team",
+      "accountId": "111111111111",
+      "region": "us-east-1",
+      "queueName": "changeset-consumer",
+      "team": "Platform Engineering",
+      "contact": "platform-eng@company.com",
+      "description": "Real-time reaction to all entity changes",
+      "filterPolicy": {
+        "eventType": ["ENTITY_CHANGESET"]
+      },
+      "s3ReadAccess": true,
+      "processingType": "microservice"
+    },
+    {
+      "name": "search-team",
+      "accountId": "222222222222",
+      "region": "us-east-1",
+      "queueName": "search-index-updates",
+      "team": "Search & Discovery",
+      "contact": "search-team@company.com",
+      "description": "Sync OpenSearch index — INSERT and UPDATE only, ignore DELETEs",
+      "filterPolicy": {
+        "eventType": ["ENTITY_CHANGESET"],
+        "changeType": ["INSERT", "UPDATE"]
+      },
+      "s3ReadAccess": true,
+      "processingType": "search"
+    },
+    {
+      "name": "audit-team",
+      "accountId": "333333333333",
+      "region": "us-east-1",
+      "queueName": "audit-changeset-queue",
+      "team": "Security & Compliance",
+      "contact": "audit@company.com",
+      "description": "Immutable compliance audit trail for all entity changes",
+      "filterPolicy": {
+        "eventType": ["ENTITY_CHANGESET"]
+      },
+      "s3ReadAccess": false,
+      "processingType": "audit"
+    },
+    {
+      "name": "analytics-team",
+      "accountId": "444444444444",
+      "region": "us-east-1",
+      "queueName": "analytics-batch-queue",
+      "team": "Data & Analytics",
+      "contact": "analytics@company.com",
+      "description": "Batch load changesets into Redshift — receives manifest summary only",
+      "filterPolicy": {
+        "eventType": ["BATCH_MANIFEST"]
+      },
+      "s3ReadAccess": true,
+      "processingType": "analytics"
+    },
+    {
+      "name": "data-lake-team",
+      "accountId": "555555555555",
+      "region": "us-east-1",
+      "queueName": "datalake-all-changes",
+      "team": "Data Platform",
+      "contact": "datalake@company.com",
+      "description": "Mirror all change events and manifests to S3 Data Lake",
+      "filterPolicy": {
+        "eventType": ["ENTITY_CHANGESET", "BATCH_MANIFEST"]
+      },
+      "s3ReadAccess": true,
+      "processingType": "datalake"
+    }
+  ]
+}

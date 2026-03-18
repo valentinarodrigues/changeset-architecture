@@ -8,21 +8,6 @@
 flowchart TD
 
     %% ── Colour palette ───────────────────────────────────────────────────
-    %% Brown   = external / non-AWS system
-    %% Magenta = EventBridge (scheduler + rule)
-    %% Orange  = Lambda — ingestion side
-    %% Green   = S3 Landing Zone
-    %% Navy    = Step Functions NEW states
-    %% Blue    = Step Functions REUSED states
-    %% Purple  = EMR / Spark
-    %% Dark green = S3 Processed Zone
-    %% Red     = SNS Topic
-    %% Maroon  = Dead Letter Queues
-    %% Teal    = SQS consumer queues
-    %% Amber   = Lambda — consumer side
-    %% Grey-blue = Observability
-    %% Burnt red = Alert path
-
     classDef ext        fill:#5D4037,stroke:#3E2723,color:#fff
     classDef evtbridge  fill:#AD1457,stroke:#880E4F,color:#fff
     classDef lambda_in  fill:#E65100,stroke:#BF360C,color:#fff
@@ -37,68 +22,104 @@ flowchart TD
     classDef lambda_con fill:#F57F17,stroke:#E65100,color:#000
     classDef obs        fill:#37474F,stroke:#263238,color:#fff
     classDef alert      fill:#BF360C,stroke:#870000,color:#fff
+    classDef registry   fill:#0D47A1,stroke:#082E5A,color:#fff,stroke-dasharray:4 4
 
-    %% ── Subgraph layer background tints ─────────────────────────────────
-    subgraph SFTP_LAYER["① SFTP Ingestion Layer"]
-        SFTP_EXT(["🖥 External SFTP Server"])
-        EBS["⏰ EventBridge Scheduler\ncron: daily"]
-        LAMBDA_PULL["λ Lambda: SFTP Puller\n512MB · ~5 min · SSH/SFTP client"]
-        S3_LAND[("🪣 S3: Landing Zone\nlanding/{date}/{batchId}/\n  data_{type}_{batchId}.txt\n  audit_{type}_{batchId}.txt")]
+    %% ══════════════════════════════════════════════════════════════
+    %% PUBLISHER ACCOUNT  (owns: SFTP pull, EMR, Step Functions, SNS)
+    %% ══════════════════════════════════════════════════════════════
+    subgraph PUB["🏢 Publisher AWS Account  (123456789012)"]
+
+        subgraph SFTP_LAYER["① SFTP Ingestion Layer"]
+            SFTP_EXT(["🖥 External SFTP Server"])
+            EBS["⏰ EventBridge Scheduler\ncron: daily"]
+            LAMBDA_PULL["λ Lambda: SFTP Puller\n512MB · ~5 min · SSH/SFTP client"]
+            S3_LAND[("🪣 S3: Landing Zone\nlanding/{date}/{batchId}/")]
+        end
+
+        subgraph TRIGGER_LAYER["② Event Trigger Layer"]
+            EB_RULE["📡 EventBridge Rule\nS3 PutObject on audit file\n= pair-complete signal"]
+        end
+
+        subgraph SFN_LAYER["③ Step Functions Orchestration  (reused + extended)"]
+            SFN_VALIDATE{"✅ ValidatePair\nNEW — check pair present"}
+            ALERT["🔔 CloudWatch Alarm\n+ Ops SNS Alert"]
+            SFN_EMR_CREATE["🔧 CreateEMRCluster\nREUSED"]
+            SFN_MAP["🔀 MappingStep\nREUSED — enrichment / lookup"]
+            SFN_SPARK["⚡ EMR Serverless Spark\nREUSED + EXTENDED\njoin · extract · write manifest"]
+            SFN_EMR_TERM["🛑 TerminateEMR\nREUSED"]
+            SFN_PUBLISH["λ PublishChangesets\nNEW — read manifest → SNS"]
+        end
+
+        subgraph STORAGE_LAYER["④ S3 Processed Zone  (cross-account read via bucket policy)"]
+            S3_PROC[("🪣 S3: Changesets\nchangesets/{entityType}/{date}/{batchId}/\n  manifest.json · inserts/ · updates/ · deletes/")]
+        end
+
+        subgraph PUBLISH_LAYER["⑤ SNS Event Bus"]
+            SNS_TOPIC(["📣 SNS Topic\nentity-changesets\n\nMsg attributes:\n  eventType · changeType\n  entityType · batchId"])
+            SNS_DLQ[("☠ Publish DLQ")]
+            REGISTRY["📋 consumers.json\nConsumer Registry\nname · accountId · queueArn\nfilterPolicy · s3ReadAccess"]
+        end
+
+        subgraph OBS["⑦ Observability"]
+            CW["📊 CloudWatch\nDashboards + Alarms"]
+            XRAY["🔍 X-Ray Tracing"]
+        end
+
     end
 
-    subgraph TRIGGER_LAYER["② Event Trigger Layer"]
-        EB_RULE["📡 EventBridge Rule\nS3 PutObject on audit file\n= pair-complete signal"]
+    %% ══════════════════════════════════════════════════════════════
+    %% CONSUMER ACCOUNTS  (each team owns their queue + processing)
+    %% ══════════════════════════════════════════════════════════════
+    subgraph CONS["⑥ Consumer AWS Accounts  — each independently subscribed"]
+
+        subgraph ACCT_A["Account: 111111111111  —  Platform Engineering"]
+            SQS_A[/"SQS: changeset-consumer\nfilter: ENTITY_CHANGESET"/]
+            DLQ_A[("☠ DLQ")]
+            LAMBDA_A["λ Microservice Handler\nGET deltaRef → process change"]
+        end
+
+        subgraph ACCT_B["Account: 222222222222  —  Search & Discovery"]
+            SQS_B[/"SQS: search-index-updates\nfilter: ENTITY_CHANGESET\n         + changeType=[INSERT,UPDATE]"/]
+            DLQ_B[("☠ DLQ")]
+            LAMBDA_B["λ OpenSearch Indexer\nGET deltaRef → re-index"]
+        end
+
+        subgraph ACCT_C["Account: 333333333333  —  Security & Compliance"]
+            SQS_C[/"SQS: audit-changeset-queue\nfilter: ENTITY_CHANGESET"/]
+            DLQ_C[("☠ DLQ")]
+            LAMBDA_C["λ Audit Writer\n→ DynamoDB / S3 Glacier"]
+        end
+
+        subgraph ACCT_D["Account: 444444444444  —  Data & Analytics"]
+            SQS_D[/"SQS: analytics-batch-queue\nfilter: BATCH_MANIFEST"/]
+            DLQ_D[("☠ DLQ")]
+            LAMBDA_D["λ Analytics Loader\n→ Redshift COPY"]
+        end
+
+        subgraph ACCT_E["Account: 555555555555  —  Data Platform"]
+            SQS_E[/"SQS: datalake-all-changes\nfilter: ENTITY_CHANGESET\n         + BATCH_MANIFEST"/]
+            DLQ_E[("☠ DLQ")]
+            LAMBDA_E["λ Data Lake Writer\n→ S3 partitioned store"]
+        end
+
     end
 
-    subgraph SFN_LAYER["③ Step Functions Orchestration  (reused + extended)"]
-        SFN_VALIDATE{"✅ ValidatePair\nNEW state\ncheck both files present\ncheck naming convention"}
-        ALERT["🔔 CloudWatch Alarm\n+ Ops SNS Alert"]
-        SFN_EMR_CREATE["🔧 CreateEMRCluster\nREUSED"]
-        SFN_MAP["🔀 MappingStep\nREUSED — enrichment / lookup"]
-        SFN_SPARK["⚡ EMR Serverless Spark\nREUSED + EXTENDED\n• join data + audit files\n• extract changed fields\n• write changesets + manifest"]
-        SFN_EMR_TERM["🛑 TerminateEMR\nREUSED"]
-        SFN_PUBLISH["λ PublishChangesets\nNEW Lambda state\nread manifest → publish to SNS"]
-    end
-
-    subgraph STORAGE_LAYER["④ S3 Processed Zone"]
-        S3_PROC[("🪣 S3: Changesets\nchangesets/{entityType}/{date}/{batchId}/\n  manifest.json\n  inserts/ · updates/ · deletes/")]
-    end
-
-    subgraph PUBLISH_LAYER["⑤ SNS Event Bus"]
-        SNS_TOPIC(["📣 SNS Topic\nentity-changesets\n\nFilter attributes:\n  changeType: INSERT|UPDATE|DELETE\n  entityType: string\n  batchId: string"])
-        SNS_DLQ[("☠ SQS DLQ\nfailed publishes")]
-    end
-
-    subgraph CONSUMER_LAYER["⑥ Downstream Consumers  — each owns their queue"]
-        SQS_A[/"SQS-A\nMicroservice\nfilter: all types"/]
-        SQS_B[/"SQS-B\nSearch Index\nfilter: INSERT, UPDATE"/]
-        SQS_C[/"SQS-C\nAudit Store\nfilter: all types"/]
-        SQS_D[/"SQS-D\nAnalytics\nbatch manifest only"/]
-        DLQ_A[("☠ DLQ-A")]
-        DLQ_B[("☠ DLQ-B")]
-        DLQ_C[("☠ DLQ-C")]
-        DLQ_D[("☠ DLQ-D")]
-        LAMBDA_A["λ Microservice Handler\nfetches deltaRef from S3"]
-        LAMBDA_B["λ OpenSearch Indexer\nfetches deltaRef from S3"]
-        LAMBDA_C["λ Audit Writer\n→ DynamoDB / S3 Glacier"]
-        LAMBDA_D["λ Analytics Loader\n→ Redshift / Data Lake\nbulk reads S3 processed zone"]
-    end
-
-    subgraph OBS["⑦ Observability"]
-        CW["📊 CloudWatch\nDashboards + Alarms\nDLQ depth · EMR failures\nSFN errors · SNS throttles"]
-        XRAY["🔍 X-Ray Tracing\nend-to-end latency"]
-    end
-
-    %% ── Subgraph background tints ────────────────────────────────────────
+    %% ── Subgraph styles ──────────────────────────────────────────────────
+    style PUB           fill:#FAFAFA,stroke:#455A64,stroke-width:3px,color:#000
+    style CONS          fill:#F3F8FF,stroke:#1565C0,stroke-width:3px,color:#000
     style SFTP_LAYER    fill:#FBE9E7,stroke:#FF8A65,color:#000
     style TRIGGER_LAYER fill:#FCE4EC,stroke:#F48FB1,color:#000
     style SFN_LAYER     fill:#E3F2FD,stroke:#90CAF9,color:#000
     style STORAGE_LAYER fill:#E8F5E9,stroke:#A5D6A7,color:#000
     style PUBLISH_LAYER fill:#FFEBEE,stroke:#EF9A9A,color:#000
-    style CONSUMER_LAYER fill:#E0F2F1,stroke:#80CBC4,color:#000
     style OBS           fill:#ECEFF1,stroke:#B0BEC5,color:#000
+    style ACCT_A        fill:#E8F5E9,stroke:#66BB6A,color:#000
+    style ACCT_B        fill:#E8F5E9,stroke:#66BB6A,color:#000
+    style ACCT_C        fill:#E8F5E9,stroke:#66BB6A,color:#000
+    style ACCT_D        fill:#E8F5E9,stroke:#66BB6A,color:#000
+    style ACCT_E        fill:#E8F5E9,stroke:#66BB6A,color:#000
 
-    %% ── Assign colours to nodes ──────────────────────────────────────────
+    %% ── Node colours ─────────────────────────────────────────────────────
     class SFTP_EXT ext
     class EBS,EB_RULE evtbridge
     class LAMBDA_PULL lambda_in
@@ -108,23 +129,19 @@ flowchart TD
     class SFN_SPARK emr
     class S3_PROC s3_proc
     class SNS_TOPIC sns
-    class SNS_DLQ,DLQ_A,DLQ_B,DLQ_C,DLQ_D dlq
-    class SQS_A,SQS_B,SQS_C,SQS_D sqs
-    class LAMBDA_A,LAMBDA_B,LAMBDA_C,LAMBDA_D lambda_con
+    class SNS_DLQ,DLQ_A,DLQ_B,DLQ_C,DLQ_D,DLQ_E dlq
+    class SQS_A,SQS_B,SQS_C,SQS_D,SQS_E sqs
+    class LAMBDA_A,LAMBDA_B,LAMBDA_C,LAMBDA_D,LAMBDA_E lambda_con
     class CW,XRAY obs
     class ALERT alert
+    class REGISTRY registry
 
     %% ── Edges ────────────────────────────────────────────────────────────
-    %% Ingestion
     EBS -->|"daily trigger"| LAMBDA_PULL
     LAMBDA_PULL -->|"poll + download"| SFTP_EXT
     LAMBDA_PULL -->|"PUT data + audit file"| S3_LAND
-
-    %% Trigger
-    S3_LAND -->|"S3 PutObject event\n(audit file arrival)"| EB_RULE
+    S3_LAND -->|"S3 PutObject event\naudit file arrival"| EB_RULE
     EB_RULE -->|"StartExecution"| SFN_VALIDATE
-
-    %% Step Function flow
     SFN_VALIDATE -->|"pair missing"| ALERT
     SFN_VALIDATE -->|"pair valid"| SFN_EMR_CREATE
     SFN_EMR_CREATE --> SFN_MAP
@@ -133,34 +150,38 @@ flowchart TD
     SFN_SPARK --> SFN_EMR_TERM
     SFN_EMR_TERM --> SFN_PUBLISH
     SFN_PUBLISH -->|"read manifest"| S3_PROC
-    SFN_PUBLISH -->|"PublishBatch\n10 msgs/call"| SNS_TOPIC
+    SFN_PUBLISH -->|"PublishBatch"| SNS_TOPIC
     SFN_PUBLISH -.->|"on failure"| SNS_DLQ
+    REGISTRY -.->|"drives subscriptions\n+ filter policies"| SNS_TOPIC
 
-    %% SNS fanout
-    SNS_TOPIC -->|"filter: all"| SQS_A
-    SNS_TOPIC -->|"filter: INSERT,UPDATE"| SQS_B
-    SNS_TOPIC -->|"filter: all"| SQS_C
-    SNS_TOPIC -->|"batch manifest event"| SQS_D
+    %% Cross-account SNS → SQS  (each consumer's queue resource policy allows this)
+    SNS_TOPIC -->|"cross-account\nSQS delivery"| SQS_A
+    SNS_TOPIC -->|"cross-account\nSQS delivery"| SQS_B
+    SNS_TOPIC -->|"cross-account\nSQS delivery"| SQS_C
+    SNS_TOPIC -->|"cross-account\nSQS delivery"| SQS_D
+    SNS_TOPIC -->|"cross-account\nSQS delivery"| SQS_E
 
-    %% Consumer processing
     SQS_A --> LAMBDA_A
     SQS_B --> LAMBDA_B
     SQS_C --> LAMBDA_C
     SQS_D --> LAMBDA_D
+    SQS_E --> LAMBDA_E
     SQS_A -.->|"max retries"| DLQ_A
     SQS_B -.->|"max retries"| DLQ_B
     SQS_C -.->|"max retries"| DLQ_C
     SQS_D -.->|"max retries"| DLQ_D
+    SQS_E -.->|"max retries"| DLQ_E
 
-    %% S3 fetch
-    LAMBDA_A -.->|"GET deltaRef"| S3_PROC
-    LAMBDA_B -.->|"GET deltaRef"| S3_PROC
-    LAMBDA_D -.->|"bulk read"| S3_PROC
+    %% Cross-account S3 reads (bucket policy grants s3:GetObject to consumer accounts)
+    LAMBDA_A -.->|"GET deltaRef\n(cross-account S3 read)"| S3_PROC
+    LAMBDA_B -.->|"GET deltaRef\n(cross-account S3 read)"| S3_PROC
+    LAMBDA_D -.->|"COPY bulk read\n(cross-account S3 read)"| S3_PROC
+    LAMBDA_E -.->|"GET all events\n(cross-account S3 read)"| S3_PROC
 
     %% Observability
     SFN_VALIDATE & SFN_SPARK & SFN_PUBLISH -.-> CW
-    SNS_DLQ & DLQ_A & DLQ_B & DLQ_C & DLQ_D -.-> CW
-    LAMBDA_A & LAMBDA_B & LAMBDA_C & LAMBDA_D -.-> XRAY
+    SNS_DLQ & DLQ_A & DLQ_B & DLQ_C & DLQ_D & DLQ_E -.-> CW
+    LAMBDA_A & LAMBDA_B & LAMBDA_C & LAMBDA_D & LAMBDA_E -.-> XRAY
 ```
 
 ### Colour Legend
