@@ -6,6 +6,39 @@
 
 ```mermaid
 flowchart TD
+
+    %% ── Colour palette ───────────────────────────────────────────────────
+    %% Brown   = external / non-AWS system
+    %% Magenta = EventBridge (scheduler + rule)
+    %% Orange  = Lambda — ingestion side
+    %% Green   = S3 Landing Zone
+    %% Navy    = Step Functions NEW states
+    %% Blue    = Step Functions REUSED states
+    %% Purple  = EMR / Spark
+    %% Dark green = S3 Processed Zone
+    %% Red     = SNS Topic
+    %% Maroon  = Dead Letter Queues
+    %% Teal    = SQS consumer queues
+    %% Amber   = Lambda — consumer side
+    %% Grey-blue = Observability
+    %% Burnt red = Alert path
+
+    classDef ext        fill:#5D4037,stroke:#3E2723,color:#fff
+    classDef evtbridge  fill:#AD1457,stroke:#880E4F,color:#fff
+    classDef lambda_in  fill:#E65100,stroke:#BF360C,color:#fff
+    classDef s3_land    fill:#2E7D32,stroke:#1B5E20,color:#fff
+    classDef sfn_new    fill:#1A237E,stroke:#0D47A1,color:#fff
+    classDef sfn_reuse  fill:#1565C0,stroke:#0D47A1,color:#fff
+    classDef emr        fill:#4A148C,stroke:#38006B,color:#fff
+    classDef s3_proc    fill:#004D40,stroke:#00251A,color:#fff
+    classDef sns        fill:#B71C1C,stroke:#7F0000,color:#fff
+    classDef dlq        fill:#880E4F,stroke:#560027,color:#fff
+    classDef sqs        fill:#006064,stroke:#003E4A,color:#fff
+    classDef lambda_con fill:#F57F17,stroke:#E65100,color:#000
+    classDef obs        fill:#37474F,stroke:#263238,color:#fff
+    classDef alert      fill:#BF360C,stroke:#870000,color:#fff
+
+    %% ── Subgraph layer background tints ─────────────────────────────────
     subgraph SFTP_LAYER["① SFTP Ingestion Layer"]
         SFTP_EXT(["🖥 External SFTP Server"])
         EBS["⏰ EventBridge Scheduler\ncron: daily"]
@@ -56,6 +89,32 @@ flowchart TD
         XRAY["🔍 X-Ray Tracing\nend-to-end latency"]
     end
 
+    %% ── Subgraph background tints ────────────────────────────────────────
+    style SFTP_LAYER    fill:#FBE9E7,stroke:#FF8A65,color:#000
+    style TRIGGER_LAYER fill:#FCE4EC,stroke:#F48FB1,color:#000
+    style SFN_LAYER     fill:#E3F2FD,stroke:#90CAF9,color:#000
+    style STORAGE_LAYER fill:#E8F5E9,stroke:#A5D6A7,color:#000
+    style PUBLISH_LAYER fill:#FFEBEE,stroke:#EF9A9A,color:#000
+    style CONSUMER_LAYER fill:#E0F2F1,stroke:#80CBC4,color:#000
+    style OBS           fill:#ECEFF1,stroke:#B0BEC5,color:#000
+
+    %% ── Assign colours to nodes ──────────────────────────────────────────
+    class SFTP_EXT ext
+    class EBS,EB_RULE evtbridge
+    class LAMBDA_PULL lambda_in
+    class S3_LAND s3_land
+    class SFN_VALIDATE,SFN_PUBLISH sfn_new
+    class SFN_EMR_CREATE,SFN_MAP,SFN_EMR_TERM sfn_reuse
+    class SFN_SPARK emr
+    class S3_PROC s3_proc
+    class SNS_TOPIC sns
+    class SNS_DLQ,DLQ_A,DLQ_B,DLQ_C,DLQ_D dlq
+    class SQS_A,SQS_B,SQS_C,SQS_D sqs
+    class LAMBDA_A,LAMBDA_B,LAMBDA_C,LAMBDA_D lambda_con
+    class CW,XRAY obs
+    class ALERT alert
+
+    %% ── Edges ────────────────────────────────────────────────────────────
     %% Ingestion
     EBS -->|"daily trigger"| LAMBDA_PULL
     LAMBDA_PULL -->|"poll + download"| SFTP_EXT
@@ -103,6 +162,25 @@ flowchart TD
     SNS_DLQ & DLQ_A & DLQ_B & DLQ_C & DLQ_D -.-> CW
     LAMBDA_A & LAMBDA_B & LAMBDA_C & LAMBDA_D -.-> XRAY
 ```
+
+### Colour Legend
+
+| Colour | Node type |
+|--------|-----------|
+| 🟤 Brown | External / non-AWS system (SFTP server) |
+| 🩷 Magenta | EventBridge (Scheduler + Rule) |
+| 🟠 Orange | Lambda — ingestion side (SFTP Puller) |
+| 🟢 Green | S3 Landing Zone |
+| 🔵 Navy | Step Functions **NEW** states (ValidatePair, PublishChangesets) |
+| 💙 Blue | Step Functions **REUSED** states (CreateEMR, MappingStep, TerminateEMR) |
+| 🟣 Purple | EMR Serverless / Spark |
+| 🌲 Dark green | S3 Processed Zone (changesets) |
+| 🔴 Red | SNS Topic |
+| 🟥 Maroon | Dead Letter Queues (all DLQs) |
+| 🩵 Teal | SQS consumer queues |
+| 🟡 Amber | Lambda — consumer side |
+| 🩶 Grey-blue | Observability (CloudWatch, X-Ray) |
+| 🔥 Burnt red | Alert / failure path |
 
 ---
 
